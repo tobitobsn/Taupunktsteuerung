@@ -13,10 +13,14 @@
   Keine externe Bibliothek nötig.
 
   Logik:
+    Messwerte werden gleitend gemittelt (Zeitkonstante GLAETTUNG_S).
     Ein   : Td_innen - Td_außen > diffEin  UND Tinnen > tInnenMin UND RHinnen > rhInnenMin
+            UND Taußen >= tAussenMin UND keine Zwangspause
     Aus   : Differenz < diffAus ODER Tinnen < tInnenMin ODER RHinnen < rhInnenMin
     Mindestlaufzeit und Mindestpause je MIN_ZEIT_MS
-    Sensorfehler / unplausible Werte -> Lüfter sofort AUS (hat Vorrang vor Mindestzeiten)
+    Sofort AUS (Vorrang vor Mindestzeiten):
+      Sensorfehler / unplausible Werte, Frostschutz (Taußen < tAussenMin)
+    Optional: nach maxLaufMin Laufzeit Zwangspause von pauseMin (maxLaufMin = 0: aus)
     Die Regelung läuft unabhängig davon, ob WLAN verbunden ist.
 */
 
@@ -45,9 +49,13 @@ float diffEin    = 5.0;    // K
 float diffAus    = 2.0;    // K (Hysterese)
 float tInnenMin  = 10.0;   // °C, darunter nicht lüften (Auskühlen)
 float rhInnenMin = 50.0;   // %, darunter gibt es nichts zu trocknen
+float tAussenMin = -5.0;   // °C, Frostschutz: darunter nicht lüften
+float maxLaufMin = 0;      // min, maximale Laufzeit am Stück (0 = unbegrenzt)
+float pauseMin   = 10;     // min, Pause nach Erreichen der maximalen Laufzeit
 
 const unsigned long MESS_INTERVALL_MS = 5000;                 // alle 5 s messen
 const unsigned long MIN_ZEIT_MS       = 5UL * 60UL * 1000UL;  // 5 min Mindestlauf/-pause
+const float GLAETTUNG_S = 120.0;   // Zeitkonstante des gleitenden Mittels (s)
 
 // Korrekturwerte (Offset) falls Sensoren abweichen
 const float T_OFFSET_INNEN = 0.0, RH_OFFSET_INNEN = 0.0;
@@ -67,7 +75,11 @@ unsigned long zustandSeit = 0;      // für Anzeige "seit ..."
 unsigned long letzteMessung = 0;
 bool mdnsGestartet = false;
 
-// aktuelle Messwerte
+// Zwangspause nach maximaler Laufzeit
+bool pauseAktiv = false;
+unsigned long pauseStart = 0;
+
+// aktuelle (geglättete) Messwerte
 float mTIn = NAN, mRhIn = NAN, mTOut = NAN, mRhOut = NAN, mDIn = NAN, mDOut = NAN;
 bool sensorOk = false;
 
@@ -139,6 +151,15 @@ void schalte(bool on, unsigned long jetzt) {
   setRelay(fanOn);
 }
 
+// Exponentieller gleitender Mittelwert; startet beim ersten gültigen Wert neu
+float glaette(float alt, float neu) {
+  if (isnan(alt)) return neu;
+  const float k = (MESS_INTERVALL_MS / 1000.0f) / (GLAETTUNG_S + MESS_INTERVALL_MS / 1000.0f);
+  return alt + k * (neu - alt);
+}
+
+unsigned long minutenMs(float m) { return (unsigned long)(m * 60000.0f); }
+
 int16_t kodiere(float v) { return isnan(v) ? INT16_MIN : (int16_t)lroundf(v * 10.0f); }
 
 void verlaufSpeichern() {
@@ -159,34 +180,52 @@ void messen(unsigned long jetzt) {
   tIn  += T_OFFSET_INNEN;   rhIn  = constrain(rhIn  + RH_OFFSET_INNEN,  0.0, 100.0);
   tOut += T_OFFSET_AUSSEN;  rhOut = constrain(rhOut + RH_OFFSET_AUSSEN, 0.0, 100.0);
 
-  sensorOk = okIn && okOut && plausibel(tIn, rhIn) && plausibel(tOut, rhOut);
+  okIn  = okIn  && plausibel(tIn, rhIn);
+  okOut = okOut && plausibel(tOut, rhOut);
+  sensorOk = okIn && okOut;
+
+  // Gleitender Mittelwert gegen Messrauschen (Wind, Regen, Sonne am Sensor).
+  // Nach einem Fehler startet die Mittelung des betroffenen Sensors neu.
+  if (okIn)  { mTIn  = glaette(mTIn, tIn);   mRhIn  = glaette(mRhIn, rhIn); }
+  else       { mTIn  = mRhIn  = NAN; }
+  if (okOut) { mTOut = glaette(mTOut, tOut); mRhOut = glaette(mRhOut, rhOut); }
+  else       { mTOut = mRhOut = NAN; }
+
+  if (maxLaufMin <= 0 || (pauseAktiv && jetzt - pauseStart >= minutenMs(pauseMin))) pauseAktiv = false;
 
   if (!sensorOk) {
     // ---- Sensorfehler: Lüfter sofort aus ----
-    mTIn = mRhIn = mTOut = mRhOut = mDIn = mDOut = NAN;
-    if (okIn)  { mTIn = tIn;   mRhIn = rhIn; }
-    if (okOut) { mTOut = tOut; mRhOut = rhOut; }
+    mDIn = mDOut = NAN;
     Serial.printf("Sensorfehler (innen %s, aussen %s) -> Luefter AUS\n",
                   okIn ? "OK" : "FEHLER", okOut ? "OK" : "FEHLER");
     schalte(false, jetzt);
   } else {
-    mTIn = tIn; mRhIn = rhIn; mTOut = tOut; mRhOut = rhOut;
-    mDIn  = taupunkt(tIn, rhIn);
-    mDOut = taupunkt(tOut, rhOut);
+    mDIn  = taupunkt(mTIn, mRhIn);
+    mDOut = taupunkt(mTOut, mRhOut);
     float diff = mDIn - mDOut;
 
     bool zeitOk = (jetzt - letzterWechsel) >= MIN_ZEIT_MS;
+    bool frost  = mTOut < tAussenMin;
+    bool laufzeitUm = fanOn && maxLaufMin > 0 && (jetzt - letzterWechsel) >= minutenMs(maxLaufMin);
 
-    if (!fanOn && zeitOk && diff > diffEin && tIn > tInnenMin && rhIn > rhInnenMin) {
+    if (fanOn && frost) {
+      schalte(false, jetzt);                 // Frostschutz: sofort aus
+    } else if (laufzeitUm) {
+      schalte(false, jetzt);                 // maximale Laufzeit erreicht -> Pause
+      pauseAktiv = true;
+      pauseStart = jetzt;
+    } else if (!fanOn && zeitOk && !pauseAktiv && !frost &&
+               diff > diffEin && mTIn > tInnenMin && mRhIn > rhInnenMin) {
       schalte(true, jetzt);
-    } else if (fanOn && zeitOk && ((diff < diffAus) || (tIn < tInnenMin) || (rhIn < rhInnenMin))) {
+    } else if (fanOn && zeitOk && ((diff < diffAus) || (mTIn < tInnenMin) || (mRhIn < rhInnenMin))) {
       schalte(false, jetzt);
     } else {
       setRelay(fanOn);
     }
 
-    Serial.printf("In: %.1f C %.1f %% Td %.1f | Out: %.1f C %.1f %% Td %.1f | Diff %.1f K | Luefter %s\n",
-                  tIn, rhIn, mDIn, tOut, rhOut, mDOut, diff, fanOn ? "EIN" : "AUS");
+    Serial.printf("In: %.1f C %.1f %% Td %.1f | Out: %.1f C %.1f %% Td %.1f | Diff %.1f K | Luefter %s%s\n",
+                  mTIn, mRhIn, mDIn, mTOut, mRhOut, mDOut, diff, fanOn ? "EIN" : "AUS",
+                  pauseAktiv ? " (Pause)" : (frost ? " (Frostschutz)" : ""));
   }
 
   if (!verlaufGestartet || jetzt - letzterVerlauf >= VERLAUF_INTERVALL_MS) {
@@ -253,7 +292,7 @@ button{grid-column:1/-1;margin-top:4px;padding:10px;border:0;border-radius:8px;b
     <div class="row"><span>Luftfeuchte</span><span id="rhOut">–</span></div></div>
 </div>
 
-<div class="card"><div class="lbl">Taupunkt – letzte 24 Stunden</div>
+<div class="card"><div class="lbl" id="chT">Taupunkt – Verlauf</div>
   <canvas id="ch"></canvas>
   <div class="mu leg"><span style="color:var(--in)">━ innen</span><span style="color:var(--out)">━ außen</span><span style="color:var(--on)">▮ Lüfter an</span></div>
 </div>
@@ -264,6 +303,9 @@ button{grid-column:1/-1;margin-top:4px;padding:10px;border:0;border-radius:8px;b
     <label for="diffAus">Ausschalten unter Differenz (K)</label><input id="diffAus" name="diffAus" type="number" step="0.5" min="0" max="19.5">
     <label for="tMin">Innen-Temperatur mindestens (°C)</label><input id="tMin" name="tMin" type="number" step="0.5" min="-10" max="30">
     <label for="rhMin">Innen-Feuchte mindestens (%)</label><input id="rhMin" name="rhMin" type="number" step="1" min="0" max="95">
+    <label for="tAMin">Außen-Temperatur mindestens, Frostschutz (°C)</label><input id="tAMin" name="tAMin" type="number" step="0.5" min="-30" max="15">
+    <label for="maxLauf">Maximale Laufzeit am Stück (min, 0 = unbegrenzt)</label><input id="maxLauf" name="maxLauf" type="number" step="1" min="0" max="240">
+    <label for="pause">Pause danach (min)</label><input id="pause" name="pause" type="number" step="1" min="5" max="240">
     <button>Speichern</button>
   </form>
   <div class="mu" id="fm" style="margin-top:8px"></div>
@@ -272,8 +314,17 @@ button{grid-column:1/-1;margin-top:4px;padding:10px;border:0;border-radius:8px;b
 </main>
 <script>
 const $=id=>document.getElementById(id);
-const f1=v=>v==null?'–':v.toFixed(1);
-function dauer(s){if(s<3600)return Math.floor(s/60)+' min';if(s<86400)return (s/3600).toFixed(1).replace('.',',')+' h';return (s/86400).toFixed(1).replace('.',',')+' Tage';}
+const zf=(v,n)=>v.toLocaleString('de-AT',{minimumFractionDigits:n,maximumFractionDigits:n});
+const f1=v=>v==null?'–':zf(v,1);
+function dauer(s){if(s<3600)return Math.floor(s/60)+' min';if(s<86400)return zf(s/3600,1)+' h';return zf(s/86400,1)+' Tage';}
+function grund(d){
+  if(d.pauseRest>0)return 'Pause nach max. Laufzeit, noch '+dauer(d.pauseRest+59);
+  if(d.tOut<=d.tAMin)return 'Frostschutz';
+  if(d.tIn<=d.tMin)return 'innen zu kalt';
+  if(d.rhIn<=d.rhMin)return 'innen trocken genug';
+  if(d.dIn-d.dOut<=d.diffEin)return 'Differenz unter Einschaltschwelle';
+  return 'Mindestpause';
+}
 let formGeladen=false;
 
 async function daten(){
@@ -288,8 +339,8 @@ async function daten(){
     if(d.ok){df.textContent='Differenz '+f1(d.dIn-d.dOut)+' K';df.className='big';}
     else{df.textContent='Sensorfehler';df.className='big err';}
     df.style.fontSize='1.4rem';
-    $('seit').textContent=(d.fan?'an':'aus')+' seit '+dauer(d.seit);
-    if(!formGeladen){$('diffEin').value=d.diffEin;$('diffAus').value=d.diffAus;$('tMin').value=d.tMin;$('rhMin').value=d.rhMin;formGeladen=true;}
+    $('seit').textContent=(d.fan?'an':'aus')+' seit '+dauer(d.seit)+(!d.fan&&d.ok?' · '+grund(d):'');
+    if(!formGeladen){['diffEin','diffAus','tMin','rhMin','tAMin','maxLauf','pause'].forEach(k=>$(k).value=d[k]);formGeladen=true;}
     $('info').textContent='WLAN '+d.rssi+' dBm · in Betrieb seit '+dauer(d.uptime);
   }catch(e){$('diff').textContent='Keine Verbindung';$('diff').className='big err';}
 }
@@ -303,22 +354,31 @@ function zeichne(){
   c.width=w*r;c.height=h*r;const g=c.getContext('2d');g.scale(r,r);g.clearRect(0,0,w,h);
   const cs=getComputedStyle(document.documentElement),col=n=>cs.getPropertyValue(n).trim();
   g.font='12px system-ui';
-  const p=v.p,N=v.n;
-  if(p.length<2){g.fillStyle=col('--mu');g.fillText('Noch zu wenig Daten – alle 5 Minuten kommt ein Punkt dazu.',8,h/2);return;}
+  const p=v.p,N=v.n,M=p.length;
+  if(M<2){g.fillStyle=col('--mu');g.fillText('Noch zu wenig Daten – alle 5 Minuten kommt ein Punkt dazu.',8,h/2);return;}
+  // x-Achse: vorhandener Zeitraum, mindestens 1 h, höchstens 24 h
+  const S=Math.min(N-1,Math.max(M-1,12)),min=S*v.iv;
+  $('chT').textContent='Taupunkt – letzte '+(min>=1440?'24 Stunden':dauer(min*60));
   const ys=[];p.forEach(q=>{if(q[4]!=null)ys.push(q[4]);if(q[5]!=null)ys.push(q[5]);});
   if(!ys.length)return;
   let lo=Math.floor(Math.min(...ys))-1,hi=Math.ceil(Math.max(...ys))+1;
   const L=34,R=6,T=6,B=20,W=w-L-R,H=h-T-B;
-  const x=i=>L+W*(N-p.length+i)/(N-1), y=val=>T+H*(hi-val)/(hi-lo);
-  // Lüfter-Zeiten
-  g.fillStyle=col('--on');g.globalAlpha=.18;const st=W/(N-1);
-  p.forEach((q,i)=>{if(q[6])g.fillRect(x(i)-st/2,T,st+.5,H);});
+  const x=i=>L+W*(S-(M-1)+i)/S, y=val=>T+H*(hi-val)/(hi-lo);
+  // Lüfter-Zeiten: zusammenhängende Phasen als ein Rechteck
+  g.fillStyle=col('--on');g.globalAlpha=.18;const st=W/S;
+  for(let i=0;i<M;i++){
+    if(!p[i][6])continue;
+    let j=i;while(j+1<M&&p[j+1][6])j++;
+    const a=Math.max(L,x(i)-st/2),b=Math.min(L+W,x(j)+st/2);
+    g.fillRect(a,T,b-a,H);i=j;
+  }
   g.globalAlpha=1;
   // Raster
   g.strokeStyle=col('--bd');g.fillStyle=col('--mu');g.lineWidth=1;
   const schritt=Math.max(1,Math.ceil((hi-lo)/5));
   for(let t=Math.ceil(lo/schritt)*schritt;t<=hi;t+=schritt){g.beginPath();g.moveTo(L,y(t));g.lineTo(w-R,y(t));g.stroke();g.fillText(t+'°',2,y(t)+4);}
-  [[0,'−24 h'],[.5,'−12 h'],[1,'jetzt']].forEach(([f,t])=>{const tw=g.measureText(t).width;g.fillText(t,Math.min(Math.max(L+W*f-tw/2,L),w-R-tw),h-4);});
+  const zl=m=>'−'+(m<60?Math.round(m)+' min':zf(m/60,m%60?1:0)+' h');
+  [[0,zl(min)],[.5,zl(min/2)],[1,'jetzt']].forEach(([f,t])=>{const tw=g.measureText(t).width;g.fillText(t,Math.min(Math.max(L+W*f-tw/2,L),w-R-tw),h-4);});
   // Linien
   [[4,'--in'],[5,'--out']].forEach(([k,c2])=>{
     g.strokeStyle=col(c2);g.lineWidth=2;g.beginPath();let auf=false;
@@ -355,7 +415,7 @@ void handleSeite() {
 void handleDaten() {
   unsigned long jetzt = millis();
   String s;
-  s.reserve(320);
+  s.reserve(400);
   s += "{\"ok\":";     s += sensorOk ? "true" : "false";
   s += ",\"fan\":";    s += fanOn ? "true" : "false";
   s += ",\"tIn\":";    zahl(s, mTIn);
@@ -371,6 +431,15 @@ void handleDaten() {
   s += ",\"diffAus\":"; zahl(s, diffAus);
   s += ",\"tMin\":";    zahl(s, tInnenMin);
   s += ",\"rhMin\":";   zahl(s, rhInnenMin);
+  s += ",\"tAMin\":";   zahl(s, tAussenMin);
+  s += ",\"maxLauf\":"; s += (int)maxLaufMin;
+  s += ",\"pause\":";   s += (int)pauseMin;
+  unsigned long pauseRest = 0;
+  if (pauseAktiv) {
+    unsigned long ende = pauseStart + max(minutenMs(pauseMin), MIN_ZEIT_MS);
+    if ((long)(ende - jetzt) > 0) pauseRest = (ende - jetzt) / 1000;
+  }
+  s += ",\"pauseRest\":"; s += pauseRest;
   s += "}";
   server.send(200, "application/json", s);
 }
@@ -378,7 +447,9 @@ void handleDaten() {
 void handleVerlauf() {
   String s;
   s.reserve(48 * vAnzahl + 32);
-  s += "{\"n\":"; s += VERLAUF_N; s += ",\"p\":[";
+  s += "{\"n\":"; s += VERLAUF_N;
+  s += ",\"iv\":"; s += VERLAUF_INTERVALL_MS / 60000;   // Minuten pro Punkt
+  s += ",\"p\":[";
   for (int i = 0; i < vAnzahl; i++) {
     const Punkt &p = verlauf[(vKopf - vAnzahl + i + VERLAUF_N) % VERLAUF_N];
     if (i) s += ',';
@@ -399,25 +470,37 @@ void fehlerAntwort(const char *msg) {
 
 void handleEinstellungen() {
   if (!server.hasArg("diffEin") || !server.hasArg("diffAus") ||
-      !server.hasArg("tMin") || !server.hasArg("rhMin")) return fehlerAntwort("Werte fehlen");
+      !server.hasArg("tMin") || !server.hasArg("rhMin") || !server.hasArg("tAMin") ||
+      !server.hasArg("maxLauf") || !server.hasArg("pause")) return fehlerAntwort("Werte fehlen");
 
   float de = server.arg("diffEin").toFloat();
   float da = server.arg("diffAus").toFloat();
   float tm = server.arg("tMin").toFloat();
   float rm = server.arg("rhMin").toFloat();
+  float ta = server.arg("tAMin").toFloat();
+  float ml = roundf(server.arg("maxLauf").toFloat());
+  float pm = roundf(server.arg("pause").toFloat());
 
   if (de < 0.5 || de > 20)  return fehlerAntwort("Einschalt-Differenz muss 0,5 bis 20 K sein");
   if (da < 0 || da > de - 0.5) return fehlerAntwort("Ausschalt-Differenz muss mind. 0,5 K unter der Einschalt-Differenz liegen");
   if (tm < -10 || tm > 30)  return fehlerAntwort("Mindesttemperatur muss -10 bis 30 °C sein");
   if (rm < 0 || rm > 95)    return fehlerAntwort("Mindestfeuchte muss 0 bis 95 % sein");
+  if (ta < -30 || ta > 15)  return fehlerAntwort("Frostschutz-Temperatur muss -30 bis 15 °C sein");
+  if (ml != 0 && (ml < 5 || ml > 240)) return fehlerAntwort("Maximale Laufzeit muss 0 oder 5 bis 240 min sein");
+  if (pm < 5 || pm > 240)   return fehlerAntwort("Pause muss 5 bis 240 min sein");
 
   diffEin = de; diffAus = da; tInnenMin = tm; rhInnenMin = rm;
+  tAussenMin = ta; maxLaufMin = ml; pauseMin = pm;
   prefs.putFloat("diffEin", diffEin);
   prefs.putFloat("diffAus", diffAus);
   prefs.putFloat("tMin", tInnenMin);
   prefs.putFloat("rhMin", rhInnenMin);
-  Serial.printf("Neue Einstellungen: Ein %.1f K, Aus %.1f K, Tmin %.1f C, RHmin %.0f %%\n",
-                diffEin, diffAus, tInnenMin, rhInnenMin);
+  prefs.putFloat("tAMin", tAussenMin);
+  prefs.putFloat("maxLauf", maxLaufMin);
+  prefs.putFloat("pause", pauseMin);
+  Serial.printf("Neue Einstellungen: Ein %.1f K, Aus %.1f K, Tmin %.1f C, RHmin %.0f %%, "
+                "TAmin %.1f C, max. Lauf %.0f min, Pause %.0f min\n",
+                diffEin, diffAus, tInnenMin, rhInnenMin, tAussenMin, maxLaufMin, pauseMin);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -436,6 +519,9 @@ void setup() {
   diffAus    = prefs.getFloat("diffAus", diffAus);
   tInnenMin  = prefs.getFloat("tMin", tInnenMin);
   rhInnenMin = prefs.getFloat("rhMin", rhInnenMin);
+  tAussenMin = prefs.getFloat("tAMin", tAussenMin);
+  maxLaufMin = prefs.getFloat("maxLauf", maxLaufMin);
+  pauseMin   = prefs.getFloat("pause", pauseMin);
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);

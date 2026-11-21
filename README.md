@@ -4,7 +4,7 @@ Diese Steuerung schaltet einen Lüfter nur dann ein, wenn das Lüften einen Raum
 
 ## Funktionsweise
 
-Alle 5 s misst der ESP32 Temperatur und relative Feuchte innen und außen. Daraus berechnet er mit der Magnus-Formel den Taupunkt (Koeffizienten a = 17,62, b = 243,12 °C):
+Alle 5 s misst der ESP32 Temperatur und relative Feuchte innen und außen. Die Messwerte werden mit einem gleitenden Mittelwert (Zeitkonstante 2 min, `GLAETTUNG_S`) geglättet, damit Wind, Regen oder Sonne am Außensensor die Regelung nicht unruhig machen. Daraus berechnet er mit der Magnus-Formel den Taupunkt (Koeffizienten a = 17,62, b = 243,12 °C):
 
 ```
 γ  = ln(RH/100) + a·T/(b+T)
@@ -15,11 +15,13 @@ Ist die Luft außen trockener als innen, also der Taupunkt außen niedriger, dan
 
 | | Bedingung |
 |---|---|
-| **Ein** | Td innen − Td außen > `diffEin` **und** T innen > `tInnenMin` **und** rF innen > `rhInnenMin` |
+| **Ein** | Td innen − Td außen > `diffEin` **und** T innen > `tInnenMin` **und** rF innen > `rhInnenMin` **und** T außen ≥ `tAussenMin` **und** keine Pause |
 | **Aus** | Differenz < `diffAus` **oder** T innen < `tInnenMin` **oder** rF innen < `rhInnenMin` |
 
 - Zwischen zwei Schaltvorgängen liegen mindestens 5 min, sowohl als Laufzeit als auch als Pause.
 - Fällt ein Sensor aus oder liefert unplausible Werte, geht der Lüfter **sofort aus**, auch vor Ablauf der Mindestzeit.
+- **Frostschutz:** Fällt die Außentemperatur unter `tAussenMin`, geht der Lüfter ebenfalls sofort aus. So bläst die Steuerung im Winter keine eiskalte Luft auf Leitungen.
+- **Maximale Laufzeit:** Ist `maxLaufMin` größer als 0, schaltet der Lüfter nach dieser Zeit für `pauseMin` ab (mindestens aber 5 min). Das kühlt den Raum weniger aus und schont den Lüfter.
 - Die Regelung läuft auch ohne WLAN-Verbindung weiter.
 
 Standardwerte, die sich über die Webseite ändern lassen und im Flash gespeichert werden:
@@ -30,6 +32,9 @@ Standardwerte, die sich über die Webseite ändern lassen und im Flash gespeiche
 | `diffAus` | 2,0 K | Taupunkt-Differenz zum Ausschalten (Hysterese) |
 | `tInnenMin` | 10 °C | darunter nicht lüften (Auskühlen) |
 | `rhInnenMin` | 50 % | darunter gibt es nichts zu trocknen |
+| `tAussenMin` | −5 °C | Frostschutz: darunter nicht lüften |
+| `maxLaufMin` | 0 min | maximale Laufzeit am Stück (0 = unbegrenzt) |
+| `pauseMin` | 10 min | Pause nach Erreichen der maximalen Laufzeit |
 
 ## Hardware
 
@@ -46,6 +51,8 @@ Weil beide Sonden dieselbe I²C-Adresse haben, hängt jede an eigenen Pins. Vor 
 | Relais | 4 |
 
 Ist dein Relaismodul *active LOW*, setze im Sketch `RELAY_ACTIVE_LOW = true`. Weichen die Sensoren voneinander ab, kannst du sie über die Konstanten `T_OFFSET_*` und `RH_OFFSET_*` korrigieren.
+
+Der Innensensor sollte nicht direkt im Luftstrom des Lüfters und nicht direkt an einer feuchten Wand hängen, sonst misst er nicht die Raumluft. Am Einbauort sollte das WLAN-Signal besser als etwa −80 dBm sein. Bei schwächerem Empfang helfen ein Repeater oder ein ESP32-Board mit Anschluss für eine externe Antenne (u.FL).
 
 > ⚠️ Am Relais liegt Netzspannung (230 V) an. Installation nur durch eine Elektrofachkraft.
 
@@ -78,8 +85,8 @@ arduino-cli upload --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc \
 Die Webseite ist unter **http://taupunkt.local** erreichbar, alternativ unter der IP-Adresse, die der serielle Monitor ausgibt. Sie zeigt:
 
 - Temperatur, Feuchte und Taupunkt innen und außen
-- den Lüfterstatus mit Laufzeit seit dem letzten Wechsel
-- den Verlauf der letzten 24 h (ein Punkt alle 5 min; liegt im RAM und ist nach einem Neustart leer)
+- den Lüfterstatus mit Laufzeit seit dem letzten Wechsel und, wenn er aus ist, den Grund dafür
+- den Verlauf der letzten 24 h (ein Punkt alle 5 min; liegt im RAM und ist nach einem Neustart leer). Solange noch keine 24 h aufgezeichnet sind, zeigt das Diagramm nur den vorhandenen Zeitraum (mindestens 1 h).
 - ein Formular für die Schwellen
 
 | Pfad | Methode | Inhalt |
@@ -87,5 +94,5 @@ Die Webseite ist unter **http://taupunkt.local** erreichbar, alternativ unter de
 | `/` | GET | Webseite |
 | `/daten` | GET | aktuelle Werte als JSON |
 | `/verlauf` | GET | 24-h-Verlauf als JSON |
-| `/einstellungen` | POST | Schwellen setzen (`diffEin`, `diffAus`, `tMin`, `rhMin`) |
+| `/einstellungen` | POST | Schwellen setzen (`diffEin`, `diffAus`, `tMin`, `rhMin`, `tAMin`, `maxLauf`, `pause`) |
 | `/favicon.svg` | GET | Icon (Lüfterblatt) |
