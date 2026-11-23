@@ -70,6 +70,22 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc --output-dir build 
 arduino-cli upload  --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc -p /dev/cu.usbmodem101 --input-dir build
 ```
 
+## WLAN-Verbindung
+
+Reißt die WLAN-Verbindung ab, versucht der ESP32 alle 30 s, sich neu anzumelden. Bekommt er eine Stunde lang keine Verbindung, startet er neu und schaltet vorher den Lüfter aus. Die Regelung läuft in der Zwischenzeit normal weiter. Nach einem Neustart ist der Verlauf leer.
+
+Der serielle Monitor (115200 Baud) zeigt, was mit dem WLAN los ist:
+
+```
+WLAN weiterhin getrennt (Status 5) -> neuer Verbindungsversuch
+  * MeinWLAN                  -92 dBm  Kanal 3
+```
+
+- **Status:** 1 = Netz nicht gefunden, 4 = Anmeldung fehlgeschlagen (z. B. falsches Passwort), 5 = Verbindung verloren, 6 = getrennt.
+- **Netzliste:** Alle 2 min listet der ESP32 die Netze auf, die er sieht. Das eigene Netz ist mit `*` markiert. Liegt es bei etwa −90 dBm oder schwächer, ist der Empfang zu schlecht für eine stabile Verbindung.
+
+Nach einem Neustart kann der Router dem ESP32 eine neue IP-Adresse geben, und `taupunkt.local` funktioniert nicht in jedem Netz zuverlässig. Damit die Adresse gleich bleibt, richte im Router eine DHCP-Reservierung für den ESP32 ein. Die aktuelle Adresse steht nach dem Start im seriellen Monitor (`WLAN verbunden: http://…`).
+
 ## Update über WLAN (OTA)
 
 Nach dem ersten USB-Upload kannst du jeden weiteren Sketch über WLAN hochladen. In der Arduino-IDE erscheint das Board als Netzwerk-Port `taupunkt`. Beim Upload fragt die IDE nach `OTA_PASS`. Während des Updates schaltet der ESP32 den Lüfter aus.
