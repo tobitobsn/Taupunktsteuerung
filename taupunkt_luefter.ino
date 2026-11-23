@@ -74,6 +74,9 @@ unsigned long letzterWechsel = 0;   // für Mindestzeiten
 unsigned long zustandSeit = 0;      // für Anzeige "seit ..."
 unsigned long letzteMessung = 0;
 bool mdnsGestartet = false;
+unsigned long wlanWegSeit = 0;      // 0 = verbunden
+int wlanVersuche = 0;
+const unsigned long WLAN_NEU_MS = 30000;   // alle 30 s neu verbinden, solange getrennt
 
 // Zwangspause nach maximaler Laufzeit
 bool pauseAktiv = false;
@@ -550,7 +553,50 @@ void loop() {
   server.handleClient();
   if (mdnsGestartet) ArduinoOTA.handle();
 
-  if (WiFi.status() == WL_CONNECTED) {
+  unsigned long jetzt = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // Auto-Reconnect gibt bei schwachem Signal irgendwann auf -> selbst neu verbinden
+    if (wlanWegSeit == 0) {
+      wlanWegSeit = jetzt | 1;
+      Serial.println("WLAN getrennt");
+    } else if (jetzt - wlanWegSeit >= WLAN_NEU_MS) {
+      // Status: 1 = SSID nicht gefunden, 4 = Verbindung fehlgeschlagen, 6 = getrennt
+      Serial.printf("WLAN weiterhin getrennt (Status %d) -> neuer Verbindungsversuch\n", WiFi.status());
+      WiFi.disconnect(false, true);          // laufenden Verbindungsversuch abbrechen
+      delay(200);
+      if (wlanVersuche % 4 == 0) {           // alle 2 min: sichtbare Netze ausgeben
+        int n = WiFi.scanNetworks();
+        if (n < 0) Serial.printf("  Scan fehlgeschlagen (%d)\n", n);
+        bool gefunden = false;
+        for (int i = 0; i < n; i++) {
+          bool unser = WiFi.SSID(i) == WLAN_SSID;
+          gefunden |= unser;
+          Serial.printf("  %s%-24s %4d dBm  Kanal %d\n", unser ? "* " : "  ",
+                        WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i));
+        }
+        if (!gefunden) Serial.println("  -> eigenes Netz nicht sichtbar");
+        WiFi.scanDelete();
+      }
+      WiFi.begin(WLAN_SSID, WLAN_PASS);
+      WiFi.setTxPower(WIFI_POWER_8_5dBm);
+      wlanWegSeit = jetzt | 1;
+      wlanVersuche++;
+      if (wlanVersuche >= 120) {
+        // nach ca. 1 h ohne WLAN: Neustart (Lüfter vorher sicher aus)
+        Serial.println("WLAN-Neustart des ESP32");
+        setRelay(false);
+        delay(100);
+        ESP.restart();
+      }
+    }
+  } else {
+    if (wlanWegSeit != 0) {
+      Serial.printf("WLAN wieder verbunden: http://%s (RSSI %d dBm)\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
+    wlanWegSeit = 0;
+    wlanVersuche = 0;
     if (!mdnsGestartet) {
       mdnsGestartet = true;
       if (MDNS.begin(HOSTNAME)) {
@@ -567,7 +613,6 @@ void loop() {
     }
   }
 
-  unsigned long jetzt = millis();
   if (jetzt - letzteMessung >= MESS_INTERVALL_MS) {
     letzteMessung = jetzt;
     messen(jetzt);
