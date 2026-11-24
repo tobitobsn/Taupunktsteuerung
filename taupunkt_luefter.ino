@@ -77,6 +77,9 @@ bool mdnsGestartet = false;
 unsigned long wlanWegSeit = 0;      // 0 = verbunden
 int wlanVersuche = 0;
 const unsigned long WLAN_NEU_MS = 30000;   // alle 30 s neu verbinden, solange getrennt
+// Sendeleistung: 8,5 dBm hilft bei manchen SuperMini-Boards gegen Verbindungsprobleme,
+// bei schwachem Empfang hört der Router den ESP32 dann aber nicht mehr.
+const wifi_power_t WLAN_SENDELEISTUNG = WIFI_POWER_15dBm;
 
 // Zwangspause nach maximaler Laufzeit
 bool pauseAktiv = false;
@@ -528,9 +531,9 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(false);         // Neuverbinden übernimmt loop()
   WiFi.begin(WLAN_SSID, WLAN_PASS);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);   // stabiler bei der SuperMini-Antenne
+  WiFi.setTxPower(WLAN_SENDELEISTUNG);
 
   server.on("/", HTTP_GET, handleSeite);
   server.on("/favicon.svg", HTTP_GET, []() {
@@ -563,8 +566,9 @@ void loop() {
     } else if (jetzt - wlanWegSeit >= WLAN_NEU_MS) {
       // Status: 1 = SSID nicht gefunden, 4 = Verbindung fehlgeschlagen, 6 = getrennt
       Serial.printf("WLAN weiterhin getrennt (Status %d) -> neuer Verbindungsversuch\n", WiFi.status());
-      WiFi.disconnect(false, true);          // laufenden Verbindungsversuch abbrechen
-      delay(200);
+      WiFi.disconnect(true);                 // Funk aus: bricht laufenden Versuch sicher ab
+      delay(100);
+      WiFi.mode(WIFI_STA);
       if (wlanVersuche % 4 == 0) {           // alle 2 min: sichtbare Netze ausgeben
         int n = WiFi.scanNetworks();
         if (n < 0) Serial.printf("  Scan fehlgeschlagen (%d)\n", n);
@@ -579,7 +583,7 @@ void loop() {
         WiFi.scanDelete();
       }
       WiFi.begin(WLAN_SSID, WLAN_PASS);
-      WiFi.setTxPower(WIFI_POWER_8_5dBm);
+      WiFi.setTxPower(WLAN_SENDELEISTUNG);
       wlanWegSeit = jetzt | 1;
       wlanVersuche++;
       if (wlanVersuche >= 120) {
