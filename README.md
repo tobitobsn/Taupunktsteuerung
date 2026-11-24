@@ -100,9 +100,9 @@ arduino-cli upload --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc \
 
 Die Webseite ist unter **http://taupunkt.local** erreichbar, alternativ unter der IP-Adresse, die der serielle Monitor ausgibt. Sie zeigt:
 
-- Temperatur, Feuchte und Taupunkt innen und außen
+- Temperatur, relative und absolute Feuchte (g/m³) und Taupunkt innen und außen
 - den Lüfterstatus mit Laufzeit seit dem letzten Wechsel und, wenn er aus ist, den Grund dafür
-- den Verlauf der letzten 24 h (ein Punkt alle 5 min; liegt im RAM und ist nach einem Neustart leer). Solange noch keine 24 h aufgezeichnet sind, zeigt das Diagramm nur den vorhandenen Zeitraum (mindestens 1 h).
+- den Verlauf der letzten 24 h (ein Punkt alle 5 min; liegt im RAM und ist nach einem Neustart leer). Solange noch keine 24 h aufgezeichnet sind, zeigt das Diagramm nur den vorhandenen Zeitraum (mindestens 1 h). Über die Knöpfe über dem Diagramm lässt sich zwischen Taupunkt, Temperatur, relativer und absoluter Feuchte umschalten; die Auswahl merkt sich der Browser.
 - ein Formular für die Schwellen
 
 | Pfad | Methode | Inhalt |

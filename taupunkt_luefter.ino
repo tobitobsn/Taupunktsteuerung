@@ -276,6 +276,11 @@ h1{font-size:1.25rem;margin:4px 0 14px}
 .err{color:var(--err)}
 canvas{width:100%;height:220px;display:block}
 .leg span{margin-right:12px}
+.chk{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.chk .lbl{margin:0}
+.seg{display:flex;gap:4px;flex-wrap:wrap}
+.seg button{grid-column:auto;margin:0;padding:4px 10px;border:1px solid var(--bd);border-radius:999px;background:transparent;color:var(--mu);font-size:.8rem}
+.seg button.akt{background:var(--in);border-color:var(--in);color:#fff}
 form{display:grid;grid-template-columns:1fr 96px;gap:8px 12px;align-items:center}
 input{width:100%;padding:7px 8px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);font-size:1rem}
 button{grid-column:1/-1;margin-top:4px;padding:10px;border:0;border-radius:8px;background:var(--in);color:#fff;font-size:1rem;cursor:pointer}
@@ -291,14 +296,17 @@ button{grid-column:1/-1;margin-top:4px;padding:10px;border:0;border-radius:8px;b
   <div class="card"><div class="lbl" style="color:var(--in)">Innen</div>
     <div class="big" id="dIn">–</div><div class="mu">Taupunkt</div>
     <div class="row"><span>Temperatur</span><span id="tIn">–</span></div>
-    <div class="row"><span>Luftfeuchte</span><span id="rhIn">–</span></div></div>
+    <div class="row"><span>Luftfeuchte</span><span id="rhIn">–</span></div>
+    <div class="row"><span>abs. Feuchte</span><span id="ahIn">–</span></div></div>
   <div class="card"><div class="lbl" style="color:var(--out)">Außen</div>
     <div class="big" id="dOut">–</div><div class="mu">Taupunkt</div>
     <div class="row"><span>Temperatur</span><span id="tOut">–</span></div>
-    <div class="row"><span>Luftfeuchte</span><span id="rhOut">–</span></div></div>
+    <div class="row"><span>Luftfeuchte</span><span id="rhOut">–</span></div>
+    <div class="row"><span>abs. Feuchte</span><span id="ahOut">–</span></div></div>
 </div>
 
-<div class="card"><div class="lbl" id="chT">Taupunkt – Verlauf</div>
+<div class="card"><div class="chk"><div class="lbl" id="chT">Taupunkt – Verlauf</div>
+  <div class="seg" id="seg"><button data-a="tp">Taupunkt</button><button data-a="t">Temperatur</button><button data-a="rh">Rel. Feuchte</button><button data-a="ah">Abs. Feuchte</button></div></div>
   <canvas id="ch"></canvas>
   <div class="mu leg"><span style="color:var(--in)">━ innen</span><span style="color:var(--out)">━ außen</span><span style="color:var(--on)">▮ Lüfter an</span></div>
 </div>
@@ -322,6 +330,9 @@ button{grid-column:1/-1;margin-top:4px;padding:10px;border:0;border-radius:8px;b
 const $=id=>document.getElementById(id);
 const zf=(v,n)=>v.toLocaleString('de-AT',{minimumFractionDigits:n,maximumFractionDigits:n});
 const f1=v=>v==null?'–':zf(v,1);
+// absolute Feuchte in g/m³ (Magnus-Formel, gleiche Konstanten wie im ESP32)
+const absF=(t,rh)=>t==null||rh==null?null:6.112*Math.exp(17.62*t/(243.12+t))*rh*2.1674/(273.15+t);
+const f2=v=>v==null?'–':zf(v,1)+' g/m³';
 function dauer(s){if(s<3600)return Math.floor(s/60)+' min';if(s<86400)return zf(s/3600,1)+' h';return zf(s/86400,1)+' Tage';}
 function grund(d){
   if(d.pauseRest>0)return 'Pause nach max. Laufzeit, noch '+dauer(d.pauseRest+59);
@@ -339,6 +350,7 @@ async function daten(){
     $('dIn').textContent=f1(d.dIn)+' °C';  $('dOut').textContent=f1(d.dOut)+' °C';
     $('tIn').textContent=f1(d.tIn)+' °C';  $('tOut').textContent=f1(d.tOut)+' °C';
     $('rhIn').textContent=f1(d.rhIn)+' %'; $('rhOut').textContent=f1(d.rhOut)+' %';
+    $('ahIn').textContent=f2(absF(d.tIn,d.rhIn)); $('ahOut').textContent=f2(absF(d.tOut,d.rhOut));
     const b=$('fan'); b.textContent=d.fan?'Lüfter EIN':'Lüfter AUS';
     b.style.background=d.fan?'var(--on)':'var(--off)';
     const df=$('diff');
@@ -351,6 +363,17 @@ async function daten(){
   }catch(e){$('diff').textContent='Keine Verbindung';$('diff').className='big err';}
 }
 
+// Diagramm-Arten: Name, Einheit an der Achse, Werte [innen, außen] je Punkt
+const ARTEN={
+  tp:{n:'Taupunkt',e:'°',w:q=>[q[4],q[5]]},
+  t:{n:'Temperatur',e:'°',w:q=>[q[0],q[2]]},
+  rh:{n:'Rel. Feuchte',e:'%',w:q=>[q[1],q[3]]},
+  ah:{n:'Abs. Feuchte (g/m³)',e:'',w:q=>[absF(q[0],q[1]),absF(q[2],q[3])]}
+};
+let art=localStorage.getItem('art'); if(!ARTEN[art])art='tp';
+function zeigeArt(){document.querySelectorAll('#seg button').forEach(b=>b.classList.toggle('akt',b.dataset.a===art));}
+$('seg').addEventListener('click',e=>{const a=e.target.dataset&&e.target.dataset.a;if(!a)return;art=a;localStorage.setItem('art',a);zeigeArt();zeichne();});
+zeigeArt();
 let letzterVerlauf=null;
 async function verlauf(){try{letzterVerlauf=await (await fetch('/verlauf')).json();zeichne();}catch(e){}}
 
@@ -360,33 +383,36 @@ function zeichne(){
   c.width=w*r;c.height=h*r;const g=c.getContext('2d');g.scale(r,r);g.clearRect(0,0,w,h);
   const cs=getComputedStyle(document.documentElement),col=n=>cs.getPropertyValue(n).trim();
   g.font='12px system-ui';
-  const p=v.p,N=v.n,M=p.length;
+  const A=ARTEN[art],N=v.n,M=v.p.length;
+  const p=v.p.map(q=>[...A.w(q),q[6]]);   // [innen, außen, lüfter]
+  $('chT').textContent=A.n+' – Verlauf';
   if(M<2){g.fillStyle=col('--mu');g.fillText('Noch zu wenig Daten – alle 5 Minuten kommt ein Punkt dazu.',8,h/2);return;}
   // x-Achse: vorhandener Zeitraum, mindestens 1 h, höchstens 24 h
   const S=Math.min(N-1,Math.max(M-1,12)),min=S*v.iv;
-  $('chT').textContent='Taupunkt – letzte '+(min>=1440?'24 Stunden':dauer(min*60));
-  const ys=[];p.forEach(q=>{if(q[4]!=null)ys.push(q[4]);if(q[5]!=null)ys.push(q[5]);});
+  $('chT').textContent=A.n+' – letzte '+(min>=1440?'24 Stunden':dauer(min*60));
+  const ys=[];p.forEach(q=>{if(q[0]!=null)ys.push(q[0]);if(q[1]!=null)ys.push(q[1]);});
   if(!ys.length)return;
   let lo=Math.floor(Math.min(...ys))-1,hi=Math.ceil(Math.max(...ys))+1;
+  if(art==='rh'){lo=Math.max(0,lo);hi=Math.min(100,hi);}
   const L=34,R=6,T=6,B=20,W=w-L-R,H=h-T-B;
   const x=i=>L+W*(S-(M-1)+i)/S, y=val=>T+H*(hi-val)/(hi-lo);
   // Lüfter-Zeiten: zusammenhängende Phasen als ein Rechteck
   g.fillStyle=col('--on');g.globalAlpha=.18;const st=W/S;
   for(let i=0;i<M;i++){
-    if(!p[i][6])continue;
-    let j=i;while(j+1<M&&p[j+1][6])j++;
+    if(!p[i][2])continue;
+    let j=i;while(j+1<M&&p[j+1][2])j++;
     const a=Math.max(L,x(i)-st/2),b=Math.min(L+W,x(j)+st/2);
     g.fillRect(a,T,b-a,H);i=j;
   }
   g.globalAlpha=1;
   // Raster
   g.strokeStyle=col('--bd');g.fillStyle=col('--mu');g.lineWidth=1;
-  const schritt=Math.max(1,Math.ceil((hi-lo)/5));
-  for(let t=Math.ceil(lo/schritt)*schritt;t<=hi;t+=schritt){g.beginPath();g.moveTo(L,y(t));g.lineTo(w-R,y(t));g.stroke();g.fillText(t+'°',2,y(t)+4);}
+  const schritt=[1,2,5,10,20,25,50].find(s=>s>=(hi-lo)/5)||100;
+  for(let t=Math.ceil(lo/schritt)*schritt;t<=hi;t+=schritt){g.beginPath();g.moveTo(L,y(t));g.lineTo(w-R,y(t));g.stroke();g.fillText(t+A.e,2,y(t)+4);}
   const zl=m=>'−'+(m<60?Math.round(m)+' min':zf(m/60,m%60?1:0)+' h');
   [[0,zl(min)],[.5,zl(min/2)],[1,'jetzt']].forEach(([f,t])=>{const tw=g.measureText(t).width;g.fillText(t,Math.min(Math.max(L+W*f-tw/2,L),w-R-tw),h-4);});
   // Linien
-  [[4,'--in'],[5,'--out']].forEach(([k,c2])=>{
+  [[0,'--in'],[1,'--out']].forEach(([k,c2])=>{
     g.strokeStyle=col(c2);g.lineWidth=2;g.beginPath();let auf=false;
     p.forEach((q,i)=>{if(q[k]==null){auf=false;return;}auf?g.lineTo(x(i),y(q[k])):g.moveTo(x(i),y(q[k]));auf=true;});
     g.stroke();
