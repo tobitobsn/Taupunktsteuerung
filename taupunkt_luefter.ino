@@ -7,7 +7,9 @@
   Ausgang:  Relaismodul für 230-V-Lüfter
   Upload:   per USB oder über WLAN (OTA, Passwort OTA_PASS in wlan_daten.h)
   Web:      http://taupunkt.local  (oder IP aus dem seriellen Monitor)
-            Aktuelle Werte, 24-h-Verlauf, Schwellen einstellbar
+            Aktuelle Werte, Verlauf 24 h / 7 Tage, Schwellen einstellbar
+  Verlauf:  wird im Flash (LittleFS) gesichert und übersteht Neustarts;
+            die Uhrzeit (NTP) ordnet eine Lücke nach dem Neustart richtig ein
 
   WLAN-Zugangsdaten in wlan_daten.h eintragen.
   Keine externe Bibliothek nötig.
@@ -31,6 +33,8 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <LittleFS.h>
+#include <time.h>
 #include "wlan_daten.h"
 
 // ---------------- Konfiguration ----------------
@@ -61,9 +65,12 @@ const float GLAETTUNG_S = 120.0;   // Zeitkonstante des gleitenden Mittels (s)
 const float T_OFFSET_INNEN = 0.0, RH_OFFSET_INNEN = 0.0;
 const float T_OFFSET_AUSSEN = 0.0, RH_OFFSET_AUSSEN = 0.0;
 
-// Verlauf: alle 5 min ein Punkt, 288 Punkte = 24 h
-const int VERLAUF_N = 288;
-const unsigned long VERLAUF_INTERVALL_MS = 5UL * 60UL * 1000UL;
+// Verlauf: kurz 288 Punkte × 5 min = 24 h (Momentwerte),
+//          lang 336 Punkte × 30 min = 7 Tage (Mittelwerte)
+const int KURZ_N = 288, LANG_N = 336;
+const uint32_t KURZ_IV_S = 5UL * 60UL, LANG_IV_S = 30UL * 60UL;
+const char *VERLAUF_DATEI = "/verlauf.bin";
+const char *VERLAUF_TEMP  = "/verlauf.tmp";
 // -----------------------------------------------
 
 WebServer server(80);
@@ -89,12 +96,25 @@ unsigned long pauseStart = 0;
 float mTIn = NAN, mRhIn = NAN, mTOut = NAN, mRhOut = NAN, mDIn = NAN, mDOut = NAN;
 bool sensorOk = false;
 
-// Verlauf (Werte x10 als int16, INT16_MIN = kein Wert)
+// Verlauf (Werte x10 als int16, INT16_MIN = kein Wert;
+// fan = Anteil der Zeit mit Lüfter an in %, LUEFTER_UNBEKANNT = kein Wert)
+const uint8_t LUEFTER_UNBEKANNT = 255;
 struct Punkt { int16_t tIn, rhIn, tOut, rhOut, dIn, dOut; uint8_t fan; };
-Punkt verlauf[VERLAUF_N];
-int vKopf = 0, vAnzahl = 0;
-unsigned long letzterVerlauf = 0;
-bool verlaufGestartet = false;
+struct Puffer {
+  Punkt *p;
+  int n;
+  uint32_t ivS;              // Sekunden pro Punkt
+  int kopf, anzahl;
+  uint32_t letzteZeit;       // Unixzeit des neuesten Punkts (0 = unbekannt)
+  unsigned long letzterMs;   // millis() des neuesten Punkts
+};
+Punkt kurzP[KURZ_N], langP[LANG_N];
+Puffer kurz = {kurzP, KURZ_N, KURZ_IV_S, 0, 0, 0, 0};
+Puffer lang = {langP, LANG_N, LANG_IV_S, 0, 0, 0, 0};
+// Summen für den 30-min-Mittelwert
+struct Summe { float tIn, rhIn, tOut, rhOut; int nIn, nOut, n, fan; } summe = {};
+bool dateisystemOk = false;
+bool verlaufBereit = false;   // erst aufzeichnen, wenn die Lücke seit dem Neustart bekannt ist
 
 // ================= Sensoren & Regelung =================
 
@@ -168,14 +188,125 @@ unsigned long minutenMs(float m) { return (unsigned long)(m * 60000.0f); }
 
 int16_t kodiere(float v) { return isnan(v) ? INT16_MIN : (int16_t)lroundf(v * 10.0f); }
 
-void verlaufSpeichern() {
-  Punkt &p = verlauf[vKopf];
-  p.tIn = kodiere(mTIn);   p.rhIn = kodiere(mRhIn);
-  p.tOut = kodiere(mTOut); p.rhOut = kodiere(mRhOut);
-  p.dIn = kodiere(mDIn);   p.dOut = kodiere(mDOut);
-  p.fan = fanOn ? 1 : 0;
-  vKopf = (vKopf + 1) % VERLAUF_N;
-  if (vAnzahl < VERLAUF_N) vAnzahl++;
+// Unixzeit, sobald per NTP gestellt, sonst 0
+uint32_t unixZeit() {
+  time_t t = time(nullptr);
+  return t > 1700000000 ? (uint32_t)t : 0;
+}
+
+Punkt punktAus(float tIn, float rhIn, float tOut, float rhOut, uint8_t fan) {
+  Punkt q;
+  q.tIn = kodiere(tIn);   q.rhIn = kodiere(rhIn);
+  q.tOut = kodiere(tOut); q.rhOut = kodiere(rhOut);
+  q.dIn  = kodiere(isnan(tIn)  || isnan(rhIn)  ? NAN : taupunkt(tIn, rhIn));
+  q.dOut = kodiere(isnan(tOut) || isnan(rhOut) ? NAN : taupunkt(tOut, rhOut));
+  q.fan = fan;
+  return q;
+}
+
+void einreihen(Puffer &b, const Punkt &q) {
+  b.p[b.kopf] = q;
+  b.kopf = (b.kopf + 1) % b.n;
+  if (b.anzahl < b.n) b.anzahl++;
+}
+
+void anhaengen(Puffer &b, const Punkt &q, unsigned long jetzt) {
+  einreihen(b, q);
+  b.letzterMs = jetzt;
+  b.letzteZeit = unixZeit();
+}
+
+// ---- Sicherung im Flash: Kopf + beide Puffer, Schreiben über Temp-Datei ----
+const uint32_t VERLAUF_MAGIE = 0x54505631;   // "TPV1"
+struct DateiKopf {
+  uint32_t magie;
+  uint16_t kurzN, langN, punktGroesse;
+  int16_t kurzKopf, kurzAnzahl, langKopf, langAnzahl;
+  uint32_t kurzZeit, langZeit;
+};
+
+void verlaufSichern() {
+  if (!dateisystemOk) return;
+  DateiKopf k = {VERLAUF_MAGIE, KURZ_N, LANG_N, sizeof(Punkt),
+                 (int16_t)kurz.kopf, (int16_t)kurz.anzahl, (int16_t)lang.kopf, (int16_t)lang.anzahl,
+                 kurz.letzteZeit, lang.letzteZeit};
+  File f = LittleFS.open(VERLAUF_TEMP, "w");
+  if (!f) return;
+  bool ok = f.write((const uint8_t *)&k, sizeof k) == sizeof k &&
+            f.write((const uint8_t *)kurzP, sizeof kurzP) == sizeof kurzP &&
+            f.write((const uint8_t *)langP, sizeof langP) == sizeof langP;
+  f.close();
+  if (ok) ok = LittleFS.rename(VERLAUF_TEMP, VERLAUF_DATEI);
+  if (!ok) Serial.println("Verlauf konnte nicht gesichert werden");
+}
+
+void verlaufLaden() {
+  File f = LittleFS.open(VERLAUF_DATEI, "r");
+  if (!f) return;
+  DateiKopf k;
+  bool ok = f.read((uint8_t *)&k, sizeof k) == sizeof k &&
+            k.magie == VERLAUF_MAGIE && k.kurzN == KURZ_N && k.langN == LANG_N &&
+            k.punktGroesse == sizeof(Punkt) &&
+            k.kurzKopf >= 0 && k.kurzKopf < KURZ_N && k.kurzAnzahl >= 0 && k.kurzAnzahl <= KURZ_N &&
+            k.langKopf >= 0 && k.langKopf < LANG_N && k.langAnzahl >= 0 && k.langAnzahl <= LANG_N &&
+            f.read((uint8_t *)kurzP, sizeof kurzP) == sizeof kurzP &&
+            f.read((uint8_t *)langP, sizeof langP) == sizeof langP;
+  f.close();
+  if (!ok) { Serial.println("Gesicherter Verlauf ungültig, starte leer"); return; }
+  kurz.kopf = k.kurzKopf; kurz.anzahl = k.kurzAnzahl; kurz.letzteZeit = k.kurzZeit;
+  lang.kopf = k.langKopf; lang.anzahl = k.langAnzahl; lang.letzteZeit = k.langZeit;
+  Serial.printf("Verlauf geladen: %d Punkte (24 h), %d Punkte (7 Tage)\n", kurz.anzahl, lang.anzahl);
+}
+
+// Zeitraster des Puffers über den Neustart fortsetzen: verpasste Punkte als Lücke
+// eintragen, nächster Punkt zur nächsten regulären Zeit.
+void lueckeFuellen(Puffer &b, uint32_t t, unsigned long jetzt) {
+  if (b.anzahl == 0 || b.letzteZeit == 0 || t < b.letzteZeit) return;
+  uint32_t luecke = t - b.letzteZeit;
+  uint32_t fehlend = luecke / b.ivS;
+  if (fehlend >= (uint32_t)b.n) { b.kopf = b.anzahl = 0; return; }   // alles veraltet
+  Punkt leer = punktAus(NAN, NAN, NAN, NAN, LUEFTER_UNBEKANNT);
+  for (uint32_t i = 0; i < fehlend; i++) einreihen(b, leer);
+  b.letzterMs = jetzt - (luecke % b.ivS) * 1000UL;
+}
+
+// Wartet nach dem Start bis zu 3 min auf die Uhrzeit, damit die Lücke bekannt ist
+void verlaufVorbereiten(unsigned long jetzt) {
+  if (verlaufBereit) return;
+  uint32_t t = unixZeit();
+  if (t == 0 && jetzt < 180000UL) return;
+  verlaufBereit = true;
+  if (t) {
+    lueckeFuellen(kurz, t, jetzt);
+    lueckeFuellen(lang, t, jetzt);
+  }
+}
+
+// Bei jeder Messung: Mittelwerte sammeln, fällige Punkte anhängen, dann sichern
+void verlaufFortschreiben(unsigned long jetzt) {
+  summe.n++;
+  if (fanOn) summe.fan++;
+  if (!isnan(mTIn))  { summe.tIn  += mTIn;  summe.rhIn  += mRhIn;  summe.nIn++; }
+  if (!isnan(mTOut)) { summe.tOut += mTOut; summe.rhOut += mRhOut; summe.nOut++; }
+
+  verlaufVorbereiten(jetzt);
+  if (!verlaufBereit) return;
+
+  bool neu = false;
+  if (jetzt - kurz.letzterMs >= KURZ_IV_S * 1000UL) {
+    anhaengen(kurz, punktAus(mTIn, mRhIn, mTOut, mRhOut, fanOn ? 100 : 0), jetzt);
+    neu = true;
+  }
+  if (jetzt - lang.letzterMs >= LANG_IV_S * 1000UL) {
+    anhaengen(lang, punktAus(summe.nIn  ? summe.tIn  / summe.nIn  : NAN,
+                             summe.nIn  ? summe.rhIn / summe.nIn  : NAN,
+                             summe.nOut ? summe.tOut / summe.nOut : NAN,
+                             summe.nOut ? summe.rhOut / summe.nOut : NAN,
+                             (uint8_t)lroundf(100.0f * summe.fan / summe.n)), jetzt);
+    summe = {};
+    neu = true;
+  }
+  if (neu) verlaufSichern();
 }
 
 void messen(unsigned long jetzt) {
@@ -234,11 +365,7 @@ void messen(unsigned long jetzt) {
                   pauseAktiv ? " (Pause)" : (frost ? " (Frostschutz)" : ""));
   }
 
-  if (!verlaufGestartet || jetzt - letzterVerlauf >= VERLAUF_INTERVALL_MS) {
-    verlaufSpeichern();
-    letzterVerlauf = jetzt;
-    verlaufGestartet = true;
-  }
+  verlaufFortschreiben(jetzt);
 }
 
 // ================= Webseite =================
@@ -306,6 +433,7 @@ button{grid-column:1/-1;margin-top:4px;padding:10px;border:0;border-radius:8px;b
 </div>
 
 <div class="card"><div class="chk"><div class="lbl" id="chT">Taupunkt – Verlauf</div>
+  <div class="seg" id="ber"><button data-b="24h">24 h</button><button data-b="7d">7 Tage</button></div>
   <div class="seg" id="seg"><button data-a="tp">Taupunkt</button><button data-a="t">Temperatur</button><button data-a="rh">Rel. Feuchte</button><button data-a="ah">Abs. Feuchte</button></div></div>
   <canvas id="ch"></canvas>
   <div class="mu leg"><span style="color:var(--in)">━ innen</span><span style="color:var(--out)">━ außen</span><span style="color:var(--on)">▮ Lüfter an</span></div>
@@ -374,8 +502,12 @@ let art=localStorage.getItem('art'); if(!ARTEN[art])art='tp';
 function zeigeArt(){document.querySelectorAll('#seg button').forEach(b=>b.classList.toggle('akt',b.dataset.a===art));}
 $('seg').addEventListener('click',e=>{const a=e.target.dataset&&e.target.dataset.a;if(!a)return;art=a;localStorage.setItem('art',a);zeigeArt();zeichne();});
 zeigeArt();
+let ber=localStorage.getItem('ber')==='7d'?'7d':'24h';
+function zeigeBer(){document.querySelectorAll('#ber button').forEach(b=>b.classList.toggle('akt',b.dataset.b===ber));}
+$('ber').addEventListener('click',e=>{const b=e.target.dataset&&e.target.dataset.b;if(!b||b===ber)return;ber=b;localStorage.setItem('ber',b);zeigeBer();letzterVerlauf=null;verlauf();});
+zeigeBer();
 let letzterVerlauf=null;
-async function verlauf(){try{letzterVerlauf=await (await fetch('/verlauf')).json();zeichne();}catch(e){}}
+async function verlauf(){try{const b=ber,v=await (await fetch('/verlauf'+(b==='7d'?'?b=7d':''))).json();if(b!==ber)return;letzterVerlauf=v;zeichne();}catch(e){}}
 
 function zeichne(){
   const v=letzterVerlauf; if(!v)return;
@@ -386,30 +518,30 @@ function zeichne(){
   const A=ARTEN[art],N=v.n,M=v.p.length;
   const p=v.p.map(q=>[...A.w(q),q[6]]);   // [innen, außen, lüfter]
   $('chT').textContent=A.n+' – Verlauf';
-  if(M<2){g.fillStyle=col('--mu');g.fillText('Noch zu wenig Daten – alle 5 Minuten kommt ein Punkt dazu.',8,h/2);return;}
-  // x-Achse: vorhandener Zeitraum, mindestens 1 h, höchstens 24 h
+  if(M<2){g.fillStyle=col('--mu');g.fillText('Noch zu wenig Daten – alle '+v.iv+' Minuten kommt ein Punkt dazu.',8,h/2);return;}
+  // x-Achse: vorhandener Zeitraum, mindestens 12 Punkte, höchstens der ganze Puffer
   const S=Math.min(N-1,Math.max(M-1,12)),min=S*v.iv;
-  $('chT').textContent=A.n+' – letzte '+(min>=1440?'24 Stunden':dauer(min*60));
+  $('chT').textContent=A.n+' – letzte '+(M>=N?(v.iv>=30?'7 Tage':'24 Stunden'):dauer(min*60));
   const ys=[];p.forEach(q=>{if(q[0]!=null)ys.push(q[0]);if(q[1]!=null)ys.push(q[1]);});
   if(!ys.length)return;
   let lo=Math.floor(Math.min(...ys))-1,hi=Math.ceil(Math.max(...ys))+1;
   if(art==='rh'){lo=Math.max(0,lo);hi=Math.min(100,hi);}
   const L=34,R=6,T=6,B=20,W=w-L-R,H=h-T-B;
   const x=i=>L+W*(S-(M-1)+i)/S, y=val=>T+H*(hi-val)/(hi-lo);
-  // Lüfter-Zeiten: zusammenhängende Phasen als ein Rechteck
-  g.fillStyle=col('--on');g.globalAlpha=.18;const st=W/S;
+  // Lüfter-Zeiten: Deckkraft = Anteil der Laufzeit, gleiche Werte als ein Rechteck
+  g.fillStyle=col('--on');const st=W/S;
   for(let i=0;i<M;i++){
-    if(!p[i][2])continue;
-    let j=i;while(j+1<M&&p[j+1][2])j++;
-    const a=Math.max(L,x(i)-st/2),b=Math.min(L+W,x(j)+st/2);
-    g.fillRect(a,T,b-a,H);i=j;
+    const f=p[i][2];if(!f)continue;
+    let j=i;while(j+1<M&&p[j+1][2]===f)j++;
+    const a=Math.round(Math.max(L,x(i)-st/2)),b=Math.round(Math.min(L+W,x(j)+st/2));
+    g.globalAlpha=.18*f;g.fillRect(a,T,b-a,H);i=j;
   }
   g.globalAlpha=1;
   // Raster
   g.strokeStyle=col('--bd');g.fillStyle=col('--mu');g.lineWidth=1;
   const schritt=[1,2,5,10,20,25,50].find(s=>s>=(hi-lo)/5)||100;
   for(let t=Math.ceil(lo/schritt)*schritt;t<=hi;t+=schritt){g.beginPath();g.moveTo(L,y(t));g.lineTo(w-R,y(t));g.stroke();g.fillText(t+A.e,2,y(t)+4);}
-  const zl=m=>'−'+(m<60?Math.round(m)+' min':zf(m/60,m%60?1:0)+' h');
+  const zl=m=>'−'+(m<60?Math.round(m)+' min':m<2880?zf(m/60,m%60?1:0)+' h':zf(m/1440,m%1440?1:0)+' Tage');
   [[0,zl(min)],[.5,zl(min/2)],[1,'jetzt']].forEach(([f,t])=>{const tw=g.measureText(t).width;g.fillText(t,Math.min(Math.max(L+W*f-tw/2,L),w-R-tw),h-4);});
   // Linien
   [[0,'--in'],[1,'--out']].forEach(([k,c2])=>{
@@ -476,20 +608,25 @@ void handleDaten() {
   server.send(200, "application/json", s);
 }
 
+// /verlauf = 24 h, /verlauf?b=7d = 7 Tage
 void handleVerlauf() {
+  const Puffer &b = server.arg("b") == "7d" ? lang : kurz;
   String s;
-  s.reserve(48 * vAnzahl + 32);
-  s += "{\"n\":"; s += VERLAUF_N;
-  s += ",\"iv\":"; s += VERLAUF_INTERVALL_MS / 60000;   // Minuten pro Punkt
+  s.reserve(50 * b.anzahl + 32);
+  s += "{\"n\":"; s += b.n;
+  s += ",\"iv\":"; s += b.ivS / 60;   // Minuten pro Punkt
   s += ",\"p\":[";
-  for (int i = 0; i < vAnzahl; i++) {
-    const Punkt &p = verlauf[(vKopf - vAnzahl + i + VERLAUF_N) % VERLAUF_N];
+  for (int i = 0; i < b.anzahl; i++) {
+    const Punkt &p = b.p[(b.kopf - b.anzahl + i + b.n) % b.n];
     if (i) s += ',';
     s += '[';
     zahl16(s, p.tIn);  s += ','; zahl16(s, p.rhIn);  s += ',';
     zahl16(s, p.tOut); s += ','; zahl16(s, p.rhOut); s += ',';
     zahl16(s, p.dIn);  s += ','; zahl16(s, p.dOut);  s += ',';
-    s += p.fan;
+    // Lüfter als Anteil 0…1
+    if (p.fan == LUEFTER_UNBEKANNT) s += "null";
+    else if (p.fan == 0 || p.fan == 100) s += p.fan / 100;
+    else s += String(p.fan / 100.0f, 2);
     s += ']';
   }
   s += "]}";
@@ -555,6 +692,10 @@ void setup() {
   maxLaufMin = prefs.getFloat("maxLauf", maxLaufMin);
   pauseMin   = prefs.getFloat("pause", pauseMin);
 
+  dateisystemOk = LittleFS.begin(true);   // beim ersten Start wird formatiert
+  if (dateisystemOk) verlaufLaden();
+  else Serial.println("LittleFS nicht verfügbar, Verlauf nur im RAM");
+
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(false);         // Neuverbinden übernimmt loop()
@@ -576,6 +717,8 @@ void setup() {
   letzterWechsel = jetzt - MIN_ZEIT_MS;  // beim Start sofort schaltbar
   zustandSeit = jetzt;
   letzteMessung = jetzt - MESS_INTERVALL_MS;
+  kurz.letzterMs = jetzt - KURZ_IV_S * 1000UL;   // erster 5-min-Punkt sofort
+  lang.letzterMs = jetzt;                         // erster 30-min-Mittelwert nach 30 min
 }
 
 void loop() {
@@ -638,6 +781,7 @@ void loop() {
       ArduinoOTA.setMdnsEnabled(false);      // mDNS läuft bereits oben
       ArduinoOTA.onStart([]() { setRelay(false); });  // Lüfter beim Update aus
       ArduinoOTA.begin();
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");   // UTC, nur für den Verlauf
       Serial.printf("WLAN verbunden: http://%s  bzw.  http://%s.local\n",
                     WiFi.localIP().toString().c_str(), HOSTNAME);
     }

@@ -1,6 +1,6 @@
 # Taupunkt-Lüftersteuerung
 
-Diese Steuerung schaltet einen Lüfter nur dann ein, wenn das Lüften einen Raum (z. B. Keller) wirklich trocknet. Dafür vergleicht sie den Taupunkt innen und außen. Sie läuft auf einem ESP32-C3 mit zwei SHT31-Sonden und einem Relais. Eine Webseite im WLAN zeigt die aktuellen Werte und den 24-h-Verlauf. Über die Webseite lassen sich auch die Schwellen einstellen.
+Diese Steuerung schaltet einen Lüfter nur dann ein, wenn das Lüften einen Raum (z. B. Keller) wirklich trocknet. Dafür vergleicht sie den Taupunkt innen und außen. Sie läuft auf einem ESP32-C3 mit zwei SHT31-Sonden und einem Relais. Eine Webseite im WLAN zeigt die aktuellen Werte und den Verlauf der letzten 24 h bzw. 7 Tage. Über die Webseite lassen sich auch die Schwellen einstellen.
 
 ## Funktionsweise
 
@@ -72,7 +72,7 @@ arduino-cli upload  --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc -p /dev/cu.usbmodem
 
 ## WLAN-Verbindung
 
-Reißt die WLAN-Verbindung ab, versucht der ESP32 alle 30 s, sich neu anzumelden. Bekommt er eine Stunde lang keine Verbindung, startet er neu und schaltet vorher den Lüfter aus. Die Regelung läuft in der Zwischenzeit normal weiter. Nach einem Neustart ist der Verlauf leer.
+Reißt die WLAN-Verbindung ab, versucht der ESP32 alle 30 s, sich neu anzumelden. Bekommt er eine Stunde lang keine Verbindung, startet er neu und schaltet vorher den Lüfter aus. Die Regelung läuft in der Zwischenzeit normal weiter. Der Verlauf bleibt bei einem Neustart erhalten (siehe unten).
 
 Der serielle Monitor (115200 Baud) zeigt, was mit dem WLAN los ist:
 
@@ -102,13 +102,13 @@ Die Webseite ist unter **http://taupunkt.local** erreichbar, alternativ unter de
 
 - Temperatur, relative und absolute Feuchte (g/m³) und Taupunkt innen und außen
 - den Lüfterstatus mit Laufzeit seit dem letzten Wechsel und, wenn er aus ist, den Grund dafür
-- den Verlauf der letzten 24 h (ein Punkt alle 5 min; liegt im RAM und ist nach einem Neustart leer). Solange noch keine 24 h aufgezeichnet sind, zeigt das Diagramm nur den vorhandenen Zeitraum (mindestens 1 h). Über die Knöpfe über dem Diagramm lässt sich zwischen Taupunkt, Temperatur, relativer und absoluter Feuchte umschalten; die Auswahl merkt sich der Browser.
+- den Verlauf, umschaltbar zwischen **24 h** (ein Momentwert alle 5 min) und **7 Tagen** (ein Mittelwert über je 30 min; die grüne Fläche zeigt hier mit ihrer Deckkraft, welchen Anteil der halben Stunde der Lüfter lief). Solange noch nicht der ganze Zeitraum aufgezeichnet ist, zeigt das Diagramm nur den vorhandenen Teil. Beide Verläufe werden nach jedem neuen Punkt im Flash (LittleFS, Partition `spiffs` des Standard-Partitionsschemas) gesichert und nach einem Neustart wieder geladen. Die Uhrzeit holt sich der ESP32 per NTP (`pool.ntp.org`); damit wird die Zeit, in der er aus war, als Lücke eingetragen. Ohne Internet wartet er nach dem Start bis zu 3 min auf die Uhrzeit und setzt den Verlauf dann ohne Lücke fort. Über die Knöpfe über dem Diagramm lässt sich zwischen Taupunkt, Temperatur, relativer und absoluter Feuchte umschalten; die Auswahl merkt sich der Browser.
 - ein Formular für die Schwellen
 
 | Pfad | Methode | Inhalt |
 |---|---|---|
 | `/` | GET | Webseite |
 | `/daten` | GET | aktuelle Werte als JSON |
-| `/verlauf` | GET | 24-h-Verlauf als JSON |
+| `/verlauf` | GET | 24-h-Verlauf als JSON (`?b=7d`: 7-Tage-Verlauf) |
 | `/einstellungen` | POST | Schwellen setzen (`diffEin`, `diffAus`, `tMin`, `rhMin`, `tAMin`, `maxLauf`, `pause`) |
 | `/favicon.svg` | GET | Icon (Lüfterblatt) |
